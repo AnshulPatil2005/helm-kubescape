@@ -59,15 +59,22 @@ func TestRunForwarding_ChildReceivesTheSignalNotAKill(t *testing.T) {
 // receiver looped, the second was swallowed and this child stayed alive.
 func TestRunForwarding_ForwardsRepeatedSignals(t *testing.T) {
 	readyPath, recordPath := helperRecordPaths(t)
+	firstPath := recordPath + ".first"
 	cmd := helperCommand(t, "count",
-		"GO_HELPER_READY="+readyPath, "GO_HELPER_RECORD="+recordPath)
+		"GO_HELPER_READY="+readyPath,
+		"GO_HELPER_FIRST="+firstPath,
+		"GO_HELPER_RECORD="+recordPath)
 
 	signals := make(chan os.Signal, 2)
 	done := make(chan int, 1)
 	go func() { done <- runForwarding(cmd, "helper", signals) }()
 
+	// Each signal is sent only once the child has acknowledged the previous one.
+	// Repeated non-realtime signals are not queued, so sending both at once can
+	// deliver a single SIGTERM and the child would never reach its second wait.
 	waitForFile(t, readyPath)
 	signals <- syscall.SIGTERM
+	waitForFile(t, firstPath)
 	signals <- syscall.SIGTERM
 
 	select {

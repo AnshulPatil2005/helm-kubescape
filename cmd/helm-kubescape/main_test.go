@@ -62,10 +62,16 @@ func TestHelperProcess(t *testing.T) {
 	case "count":
 		// Ignore the first signal and only exit on the second, so a receiver that
 		// stops after one forward leaves this child alive.
+		//
+		// The first signal is acknowledged through its own file so the test can
+		// wait for it before sending the second. POSIX does not queue repeated
+		// non-realtime signals, so two SIGTERMs sent back to back can arrive as
+		// one and this child would wait forever.
 		received := make(chan os.Signal, 2)
 		signal.Notify(received, os.Interrupt, syscall.SIGTERM)
 		ready(t)
 		<-received
+		_ = os.WriteFile(os.Getenv("GO_HELPER_FIRST"), []byte("one"), 0o600)
 		<-received
 		_ = os.WriteFile(os.Getenv("GO_HELPER_RECORD"), []byte("two"), 0o600)
 		os.Exit(0)
