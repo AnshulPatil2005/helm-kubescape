@@ -3,19 +3,37 @@ package main
 import (
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
 )
 
-// helperCommand re-execs the test binary as a child process, so these tests do not
-// depend on a shell or on kubescape being installed.
-func helperCommand(t *testing.T, mode string) *exec.Cmd {
+// helperCommand re-execs the test binary as a child process, so these tests need
+// neither a shell nor kubescape on PATH.
+func helperCommand(t *testing.T, mode string, env ...string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
 	cmd.Env = append(os.Environ(), "GO_HELPER_MODE="+mode)
+	cmd.Env = append(cmd.Env, env...)
 
 	return cmd
+}
+
+// waitForFile blocks until path exists, so a test only signals a child that has
+// finished installing its handler. Signalling before that races the default
+// disposition, which would terminate the child and look exactly like a kill.
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("child never became ready: %s was not created", path)
 }
 
 // TestHelperProcess is not a real test: it is the child the tests above run.
@@ -30,12 +48,36 @@ func TestHelperProcess(t *testing.T) {
 	case "exit7":
 		os.Exit(7)
 	case "sleep":
-		// long enough that the test drives the outcome, short enough not to wedge
-		// CI if something goes wrong
 		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "record":
+		// Record which signal actually arrived. A killed child never gets here,
+		// which is what makes this able to tell a forward from a kill.
+		received := make(chan os.Signal, 1)
+		signal.Notify(received, os.Interrupt, syscall.SIGTERM)
+		ready(t)
+		sig := <-received
+		_ = os.WriteFile(os.Getenv("GO_HELPER_RECORD"), []byte(sig.String()), 0o600)
+		os.Exit(0)
+	case "count":
+		// Ignore the first signal and only exit on the second, so a receiver that
+		// stops after one forward leaves this child alive.
+		received := make(chan os.Signal, 2)
+		signal.Notify(received, os.Interrupt, syscall.SIGTERM)
+		ready(t)
+		<-received
+		<-received
+		_ = os.WriteFile(os.Getenv("GO_HELPER_RECORD"), []byte("two"), 0o600)
 		os.Exit(0)
 	}
 	os.Exit(99)
+}
+
+func ready(t *testing.T) {
+	t.Helper()
+	if p := os.Getenv("GO_HELPER_READY"); p != "" {
+		_ = os.WriteFile(p, []byte("ready"), 0o600)
+	}
 }
 
 func TestRunForwarding_PassesThroughExitCode(t *testing.T) {
@@ -58,11 +100,7 @@ func TestRunForwarding_PassesThroughExitCode(t *testing.T) {
 	}
 }
 
-// A signal the plugin receives has to reach the child and be reported as
-// 128+signum, the shell convention. Before this, exec.CommandContext's default
-// Cancel killed the child instead, which both skipped kubescape's own shutdown and
-// turned the status into -1, surfacing as 255.
-func TestRunForwarding_ForwardsSignalAndReportsSignalStatus(t *testing.T) {
+func TestRunForwarding_ReportsSignalStatus(t *testing.T) {
 	tests := []struct {
 		name string
 		sig  syscall.Signal
@@ -92,9 +130,38 @@ func TestRunForwarding_ForwardsSignalAndReportsSignalStatus(t *testing.T) {
 	}
 }
 
+// The receiver has to keep reading for as long as the child runs. One that stopped
+// after the first signal left signal.Notify registered with nobody listening, so a
+// second SIGINT or SIGTERM was neither forwarded nor able to stop the wrapper.
+func TestRunForwarding_KeepsReadingSignalsUntilChildExits(t *testing.T) {
+	signals := make(chan os.Signal, 2)
+	signals <- syscall.SIGTERM
+	signals <- syscall.SIGINT
+
+	done := make(chan int, 1)
+	go func() { done <- runForwarding(helperCommand(t, "sleep"), "helper", signals) }()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("child was not stopped")
+	}
+
+	if left := len(signals); left != 0 {
+		t.Fatalf("%d signal(s) never read: the receiver stopped before the child exited", left)
+	}
+}
+
 func TestRunForwarding_StartFailureReportsOne(t *testing.T) {
-	cmd := exec.Command("")
-	if got := runForwarding(cmd, "helper", make(chan os.Signal)); got != 1 {
+	if got := runForwarding(exec.Command(""), "helper", make(chan os.Signal)); got != 1 {
 		t.Fatalf("exit code = %d, want 1", got)
 	}
+}
+
+// helperRecordPaths returns a ready-marker path and a record path under t.TempDir.
+func helperRecordPaths(t *testing.T) (ready, record string) {
+	t.Helper()
+	dir := t.TempDir()
+
+	return filepath.Join(dir, "ready"), filepath.Join(dir, "record")
 }

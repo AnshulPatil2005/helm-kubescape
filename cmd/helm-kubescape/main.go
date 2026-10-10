@@ -122,32 +122,53 @@ func runForwarding(cmd *exec.Cmd, name string, signals <-chan os.Signal) int {
 		return 1
 	}
 
+	// Every signal is forwarded for as long as the child runs, not just the first.
+	// signal.Notify suppresses default handling while it is registered, so a
+	// receiver that stopped after one signal would leave later SIGINT/SIGTERM
+	// neither forwarded to the child nor able to stop the wrapper, trapping a user
+	// who presses Ctrl+C again because the first one did not take.
 	var (
-		mu        sync.Mutex
-		forwarded os.Signal
+		mu    sync.Mutex
+		first os.Signal
 	)
+	childExited := make(chan struct{})
+	var receiver sync.WaitGroup
+	receiver.Add(1)
 	go func() {
-		sig, ok := <-signals
-		if !ok {
-			return
-		}
-		mu.Lock()
-		forwarded = sig
-		mu.Unlock()
-		// Windows has no signal delivery, so Signal fails there and the child is
-		// killed instead. That is the best available behaviour on that platform,
-		// rather than leaving the scan running.
-		if err := cmd.Process.Signal(sig); err != nil {
-			_ = cmd.Process.Kill()
+		defer receiver.Done()
+		for {
+			select {
+			case sig, ok := <-signals:
+				if !ok {
+					return
+				}
+				mu.Lock()
+				if first == nil {
+					first = sig
+				}
+				mu.Unlock()
+				// Windows has no signal delivery, so Signal fails there and the
+				// child is killed instead. That is the best available behaviour on
+				// that platform, rather than leaving the scan running.
+				if err := cmd.Process.Signal(sig); err != nil {
+					_ = cmd.Process.Kill()
+				}
+			case <-childExited:
+				return
+			}
 		}
 	}()
 
 	waitErr := cmd.Wait()
+	close(childExited)
+	receiver.Wait()
 
 	mu.Lock()
-	sig := forwarded
+	sig := first
 	mu.Unlock()
 
+	// The status comes from the signal the wrapper forwarded rather than the
+	// child's wait status, so it is the same where signals cannot be delivered.
 	if sig != nil {
 		if s, ok := sig.(syscall.Signal); ok {
 			return 128 + int(s)
